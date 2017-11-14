@@ -1,0 +1,12 @@
+Source: python-rdnbrd
+Section: net
+Priority: optional
+Maintainer: dwalton@cumulusnetworks.com
+Build-Depends: debhelper (>= 8.0.0), git, python-minimal, python-setuptools, dh-systemd (>= 1.5), python-ipaddr, python-daemon
+Standards-Version: 3.9.3
+Homepage:
+
+Package: python-rdnbrd
+Architecture: all
+Depends: ${misc:Depends}, ${python:Depends}
+Description: Redistribute Neighbor daemon

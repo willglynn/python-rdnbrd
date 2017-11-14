@@ -1,0 +1,71 @@
+#!/bin/sh
+#
+# netplug - policy agent for netplugd
+#
+# Copyright 2003 Key Research, Inc.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License, version 2, as
+# published by the Free Software Foundation.  You are forbidden from
+# redistributing or modifying it under the terms of any other license,
+# including other versions of the GNU General Public License.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+dev="$1"
+action="$2"
+
+case "$action" in
+in)
+    # Add path to default route list
+    if [ "$dev" = "swp1" ]; then
+	otherdev="swp2"
+    elif [ "$dev" = "swp2" ]; then
+	otherdev="swp1"
+    else
+	return 0;
+    fi
+	
+    otherdevstatus=`ip -br link show "$otherdev" | awk '{print $2}'`
+    if [ "$otherdevstatus" = "UP" ]; then
+	echo ip route replace default nexthop via 13.0.0.1 dev "$dev" onlink nexthop via 13.0.0.1 dev "$otherdev" onlink >> /tmp/n.log
+	sudo ip route replace default nexthop via 13.0.0.1 dev "$dev" onlink nexthop via 13.0.0.1 dev "$otherdev" onlink
+    else
+	echo ip route replace default nexthop via 13.0.0.1 dev "$dev" >> /tmp/n.log
+	sudo ip route replace default nexthop via 13.0.0.1 dev "$dev"
+    fi
+    ;;
+out)
+    # Add path to default route list
+    if [ "$dev" = "swp1" ]; then 
+        otherdev="swp2"
+    elif [ "$dev" = "swp2" ]; then
+        otherdev="swp1"
+    else
+        return 0;
+    fi
+
+    otherdevstatus=`ip -br link show "$otherdev" | awk '{print $2}'`
+    if [ "$otherdevstatus" = "UP" ]; then
+        echo ip route replace default nexthop via 13.0.0.1 dev "$otherdev" onlink >> /tmp/n.log
+        sudo ip route replace default nexthop via 13.0.0.1 dev "$otherdev" onlink
+    else
+        echo ip route del default >> /tmp/n.log
+        sudo ip route del default
+    fi
+    ;;
+probe)
+    exec /sbin/ip link set "$dev" up >/dev/null 2>&1
+    ;;
+*)
+    echo "I have been called with a funny action of '%s'!" 1>&2
+    exit 1
+    ;;
+esac

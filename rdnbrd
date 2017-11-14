@@ -1,0 +1,1154 @@
+#!/usr/bin/python
+
+# Copyright (C) 2014-2017 Cumulus Networks, inc.
+#
+# All Rights reserved.
+#
+# This software is subject to the Cumulus Networks End User License Agreement available
+# at the following locations:.
+#
+# Internet: https://cumulusnetworks.com/downloads/eula/latest/view/
+#
+# Cumulus Linux systems: /usr/share/cumulus/EULA.txt
+#
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program - see the file COPYING.
+#
+#
+# This is the redistribute ARP/ND daemon. It monitors the ip neighbor and link
+# groups via netlink and for every valid entry added/deleted in the neighbor
+# table, adds/deletes a route entry corresponding to the neighbor in the
+# specified table.
+
+from daemon import DaemonContext
+from ipaddr import IPAddress
+from nlmanager.nllistener import NetlinkManagerWithListener, NetlinkListener
+from nlmanager.nlpacket import (Address, Neighbor, Route,
+                                RTMGRP_LINK, RTMGRP_NEIGH, RTMGRP_IPV4_IFADDR,
+                                RTM_NEWNEIGH, RTM_DELNEIGH, RTM_NEWLINK, RTM_DELLINK, RTM_NEWADDR, RTM_DELADDR)
+from nlmanager.nlpacket import Link as nlLink
+from socket import AF_INET, AF_INET6, AF_BRIDGE
+from subprocess import CalledProcessError, check_call, check_output
+from select import select
+from time import sleep
+from threading import Thread, Event, Lock
+import argparse
+import binascii
+import datetime
+import lockfile
+import logging
+import logging.handlers
+import os
+import re
+import signal
+import socket
+import struct
+import sys
+
+log = logging.getLogger('rdnbrd')
+ARP_ETHERTYPE = 0x0806
+
+
+def logger_init(loglevel):
+    loglevel = loglevel.upper()
+
+    # Set the log level for the root logger
+    logging.getLogger().setLevel(loglevel)
+
+    syslog_h = logging.handlers.SysLogHandler(address='/dev/log')
+    formatter = logging.Formatter('rdnbrd: %(levelname)7s:  %(message)s')
+    syslog_h.setFormatter(formatter)
+    syslog_h.setLevel(loglevel)
+    log.addHandler(syslog_h)
+    logging.getLogger('nlmanager.nlmanager').addHandler(syslog_h)
+    logging.getLogger('nlmanager.nlpacket').addHandler(syslog_h)
+    logging.getLogger('nlmanager.nllistener').addHandler(syslog_h)
+    log.info("logging to syslog with level %s" % loglevel)
+
+
+def get_ifindex(ifname):
+    output = check_output(['/sbin/ip', 'link', 'show', ifname])
+
+    for line in output.splitlines():
+        re_line = re.search("^(\d+): %s: " % ifname, line)
+        if re_line:
+            return int(re_line.group(1))
+    return None
+
+
+def get_ifname(ifindex):
+    output = check_output(['/sbin/ip', 'link', 'show'])
+
+    for line in output.splitlines():
+        re_line = re.search("^%d: (\S+):" % ifindex, line)
+        if re_line:
+            return re_line.group(1)
+    return None
+
+
+def get_my_macs():
+    """
+    Return a dictionary of MAC addresses used by our own interfaces
+    """
+    macs = {}
+
+    output = check_output(['/sbin/ip', 'link', 'show'])
+    for line in output.splitlines():
+        re_line = re.search("ether (\S+)", line)
+
+        if re_line:
+            mac = re_line.group(1).replace(':', '').upper()
+            mac = "%s.%s.%s" % (mac[0:4], mac[4:8], mac[8:12])
+            macs[mac] = True
+
+    return macs
+
+
+class ArpListener(Thread):
+
+    """
+    Process ARP packets RXed for each Link. Extract the source IP/MAC
+    and update last_arp_rxed_epoch for that Host.
+    """
+
+    def __init__(self, parent):
+        Thread.__init__(self)
+        self.shutdown_event = Event()
+        self.parent = parent
+
+    def run(self):
+        ARP_REQUEST = 1
+        ARP_REPLY = 2
+        ARP_PROTOCOL_IP = 0x0800
+
+        try:
+            while True:
+
+                rx_sockets = []
+                rx_socket2link = {}
+
+                for link in self.parent.links_by_index.values():
+                    if link.up and link.src_ip and link.rx_socket:
+                        rx_sockets.append(link.rx_socket)
+                        rx_socket2link[link.rx_socket] = link
+
+                # Wait for at least one of the sockets to be ready for processing.
+                # We only let this run for 1 second so we can check to see if the
+                # shutdown flag has been set.
+                try:
+                    readable, writeable, exceptional = select(rx_sockets, [], [], 1)
+                except Exception as e:
+                    # 9 is 'Bad file descriptor', this can happen if the link goes
+                    # down between when we added link.rx_socket to rx_sockets and
+                    # when we call select()
+                    if isinstance(e.args, tuple):
+                        if e[0] == 9:
+                            continue
+                        else:
+                            raise
+                    else:
+                        raise
+
+                if self.shutdown_event.is_set():
+                    log.info("ArpListener shutting down")
+                    break
+
+                arps_rxed = []
+
+                # Parse all RXed ARP packets and create a workq entry so our parent
+                # can process the fact that these IPs are alive
+                for s in readable:
+                    link = rx_socket2link.get(s)
+
+                    try:
+                        for pkt in s.recvfrom(512):
+
+                            # recvfrom() can also return a tuple like the following...ignore these
+                            # ('swp3', 2054, 0, 1, '\x00\x02\x00\x00\x00\x01')
+                            if isinstance(pkt, tuple):
+                                continue
+
+                            arp_protocol_type = struct.unpack('>H', pkt[16:18])[0]
+                            arp_opcode = struct.unpack('>H', pkt[20:22])[0]
+
+                            if arp_protocol_type == ARP_PROTOCOL_IP and (arp_opcode == ARP_REQUEST or arp_opcode == ARP_REPLY):
+                                arp_src_mac_raw = pkt[22:28]
+                                arp_src_ip = socket.inet_ntoa(pkt[28:32])
+                                arp_src_mac = ".".join(binascii.hexlify(arp_src_mac_raw).upper()[x:x + 4]
+                                                       for x in xrange(0, len(binascii.hexlify(arp_src_mac_raw)), 4))
+
+                                if link.debug_arp:
+                                    log.debug("%s: RXed ARP %s from %s with MAC %s" %
+                                              (link, 'request' if arp_opcode == ARP_REQUEST else 'reply',
+                                               arp_src_ip, arp_src_mac))
+
+                                arps_rxed.append((link, arp_src_ip, arp_src_mac, arp_src_mac_raw))
+
+                    except Exception as e:
+                        if isinstance(e.args, tuple):
+                            # 'Network is down'...can happen if someone does an ifdown
+                            # while we are trying to read from the raw socket
+                            if e[0] == 100:
+                                log.debug("%s: 'Network is down', recvfrom() failed" % link)
+                            elif e[0] == 9:
+                                log.debug("%s: 'Bad file descriptor', recvfrom() failed" % link)
+                            elif e[0] == 6:
+                                log.debug("%s: 'No such device or address', recvfrom() failed" % self)
+                            else:
+                                raise
+                        else:
+                            raise
+
+                if arps_rxed:
+                    self.parent.workq.put(('ARP_REQUEST_OR_REPLY_RXED', arps_rxed))
+                    self.parent.alarm.set()
+
+        except Exception as e:
+            log.exception(e)
+            self.parent.caught_exception = True
+            self.parent.shutdown_event.set()
+
+
+class TimerWheel(Thread):
+
+    """
+    A basic timer wheel with 1s granularity
+    """
+
+    def __init__(self, parent):
+        Thread.__init__(self)
+        self.parent = parent
+        self.shutdown_event = Event()
+        self.events = {}
+        self.events_lock = Lock()
+
+    def run(self):
+
+        # Use os.times() (instead of time.time()) so that changes in the system
+        # date/time do not throw us off
+        epoch_previous = int(os.times()[4])
+
+        try:
+            while True:
+
+                if self.shutdown_event.is_set():
+                    log.info("TimerWheel shutting down")
+                    break
+
+                # We should only sleep for 1 second each time through this loop but
+                # if somehow we sleep for more than 1 second we need to make sure
+                # we do all of the work that we should have done in the second that
+                # we skipped. Keep track of the previous epoch that we serviced
+                # and loop from the second after that to the current second.
+                #
+                # We don't actually do the heavy lifting here, instead we stick the
+                # task on our parent's workq.
+                epoch_current = int(os.times()[4])
+                set_alarm = False
+
+                # log.info("TimerWheel service %s to %s" %
+                #          (datetime.datetime.fromtimestamp(epoch_previous).strftime('%H:%M:%S'),
+                #           datetime.datetime.fromtimestamp(epoch_current+1).strftime('%H:%M:%S')))
+
+                for x in range(epoch_previous, epoch_current + 1):
+                    # log.info("TimerWheel servicing %s" % datetime.datetime.fromtimestamp(x).strftime('%H:%M:%S'))
+
+                    while x in self.events and self.events[x]:
+                        (workq_event, workq_option) = self.events[x].pop(0)
+
+                        # log.info("TimerWheel service entries for %s with Event %s, Options %s" %
+                        #          (datetime.datetime.fromtimestamp(x).strftime('%H:%M:%S'), workq_event, workq_option))
+                        self.parent.workq.put((workq_event, workq_option))
+                        set_alarm = True
+
+                    # Remove this epoch from self.events
+                    self.events_lock.acquire()
+                    if x in self.events:
+                        del self.events[x]
+                    self.events_lock.release()
+
+                if set_alarm:
+                    self.parent.alarm.set()
+
+                epoch_previous = epoch_current
+                sleep(1)
+
+        except Exception as e:
+            log.exception(e)
+            self.parent.caught_exception = True
+            self.parent.shutdown_event.set()
+
+    # epoch is the second that this event should take place
+    def add_event(self, epoch, workq_event, workq_option):
+        self.events_lock.acquire()
+
+        if epoch not in self.events:
+            self.events[epoch] = []
+        else:
+            if (workq_event, (workq_option, epoch)) in self.events[epoch]:
+                log.warning("TimerWheel attempt to add duplicate entry at %s for Event %s, Options %s" %
+                            (datetime.datetime.fromtimestamp(epoch).strftime('%H:%M:%S'), workq_event, workq_option))
+                self.events_lock.release()
+                return
+
+        self.events[epoch].append((workq_event, (workq_option, epoch)))
+        self.events_lock.release()
+        # log.info("TimerWheel added entry at %s for Event %s, Options %s" %
+        #          (datetime.datetime.fromtimestamp(epoch).strftime('%H:%M:%S'), workq_event, workq_option))
+
+
+class Host(object):
+
+    def __init__(self, ip, mac):
+        self.ip = ip
+        self.ip_obj = IPAddress(ip)
+        self.mac = mac.upper()
+        self.mac_raw = self.mac.replace('.', '').replace(':', '').decode('hex')
+        self.last_arp_rxed_epoch = int(os.times()[4])
+
+        # True if a /32 for this host is installed in Link.route_table
+        self.rib_installed = False
+
+    def __str__(self):
+        return "%s(MAC %s)" % (self.ip, self.mac)
+
+
+class Link(object):
+
+    def __init__(self, name, index, route_table, unicast_arp_requests, debug_arp, reason):
+        self.name = str(name)
+        self.index = index
+        self.bridge = None
+        self.up = False
+        self.hosts = {}
+        self.hosts_by_mac = {}
+        self.route_table = route_table
+        self.unicast_arp_requests = unicast_arp_requests
+        self.src_ip = None
+        self.src_mac = None
+        self.src_mac_raw = None
+        self.tx_socket = None
+        self.rx_socket = None
+        self.eth_hdr_broadcast = None
+        self.arp_request_hdr = None
+        self.arp_reply_hdr = None
+        self.arp_src = None
+        log.debug("%s: created Link (%s)" % (self, reason))
+
+        # Generating debug output for all of the ARP packets can be very chatty
+        # so use a knob to control whether or not we print these. debug_arp can
+        # be None so that is why we do not just do "self.debug_arp = debug_arp" here.
+        self.debug_arp = True if debug_arp is True else False
+
+    def __str__(self):
+        return self.name
+
+    def sockets_create(self):
+        if not self.tx_socket or not self.rx_socket:
+            log.debug("%s: creating raw sockets" % self)
+
+            # Note that tx_socket and rx_socket are bound slightly differently
+            if not self.tx_socket:
+                self.tx_socket = socket.socket(socket.PF_PACKET, socket.SOCK_RAW, socket.htons(ARP_ETHERTYPE))
+                try:
+                    self.tx_socket.bind((self.name, socket.htons(ARP_ETHERTYPE)))
+                except Exception:
+                    log.info("%s: failed to create tx_socket" % self)
+                    self.tx_socket = None
+
+            if not self.rx_socket:
+                self.rx_socket = socket.socket(socket.PF_PACKET, socket.SOCK_RAW, socket.htons(ARP_ETHERTYPE))
+                try:
+                    self.rx_socket.bind((self.name, 0))
+                except Exception:
+                    log.info("%s: failed to create rx_socket" % self)
+                    self.rx_socket = None
+
+    def sockets_free(self):
+        if self.tx_socket or self.rx_socket:
+            log.debug("%s: closing raw sockets" % self)
+
+            if self.tx_socket:
+                self.tx_socket.close()
+                self.tx_socket = None
+
+            if self.rx_socket:
+                self.rx_socket.close()
+                self.rx_socket = None
+
+    def send_gratuitous_arp(self, reason):
+
+        # If we do not have an IP addresss then self.eth_hdr_broadcast will be None
+        if self.eth_hdr_broadcast:
+            log.info("%s: TX gratuitious ARP (%s)" % (self, reason))
+            pkt = self.eth_hdr_broadcast + self.arp_reply_hdr + self.arp_src + self.arp_src
+            self.tx_packet(pkt)
+
+    def set_link_up(self):
+        """
+        If the interface comes up we need to determine which hosts are reachable
+        """
+        if not self.up:
+            self.up = True
+            self.up_epoch = int(os.times()[4])
+
+            if not self.bridge:
+                log.info("%s: UP...resume verifying hosts on this link %s" % (self, [x for x in self.hosts.iterkeys()]))
+                self.sockets_create()
+                self.send_gratuitous_arp('link UP')
+
+        else:
+            log.debug("%s: UP...ignoring because we were already up" % self)
+
+    def set_link_down(self):
+        """
+        If the interface goes down we need to purge the host /32s via that interface
+        """
+        if self.up:
+            self.up = False
+            log.info("%s: DOWN...delete routes via this link" % self)
+            self.sockets_free()
+        else:
+            log.debug("%s: DOWN...ignoring because we were already down" % self)
+
+    def tx_packet(self, pkt):
+
+        try:
+            self.tx_socket.send(pkt)
+        except Exception as e:
+            if isinstance(e.args, tuple):
+                # 'Network is down'...can happen if someone does an ifdown
+                # while we are trying to send to the socket
+                if e[0] == 100:
+                    log.debug("%s: 'Network is down', send() failed" % self)
+                elif e[0] == 9:
+                    log.debug("%s: 'Bad file descriptor', send() failed" % self)
+                elif e[0] == 6:
+                    log.debug("%s: 'No such device or address', send() failed" % self)
+                else:
+                    raise
+            else:
+                raise
+
+    def arp_ping(self, current_epoch, keepalive_interval):
+        """
+        TX an ARP request for each Host
+        """
+
+        if not self.up:
+            if self.debug_arp:
+                log.debug("%s: ARP ping bulk abort (interface down)" % self)
+            return
+
+        if not self.hosts:
+            if self.debug_arp:
+                log.debug("%s: ARP ping bulk abort (no hosts)" % self)
+            return
+
+        if not self.src_ip:
+            log.info("%s: ARP ping bulk abort (no IP)" % self)
+            return
+
+        if self.debug_arp:
+            log.debug("%s: ARP ping bulk for %s" % (self, [x for x in self.hosts.iterkeys()]))
+
+        # If there are 1000s of hosts via a single interface we do not want to arping all
+        # of them at the exact same time. Split them up into groups based on the keepalive
+        # interval. If our keepalive interval is 5s then arping 1/5 of the hosts each time
+        # this method is called.  This requires that arping be called once every second.
+        epoch_remainder = current_epoch % keepalive_interval
+
+        hosts_to_arping = []
+        for host in self.hosts.itervalues():
+            host_ip_remainder = int(host.ip_obj) % keepalive_interval
+
+            if host_ip_remainder == epoch_remainder:
+                hosts_to_arping.append(host)
+
+        # TX an ARP request to each host
+        for host in hosts_to_arping:
+            arp_dst = struct.pack("!6s4s", '\x00\x00\x00\x00\x00\x00', socket.inet_aton(host.ip))
+
+            if self.unicast_arp_requests and host.mac_raw:
+                eth_hdr = struct.pack("!6s6s2s", host.mac_raw, self.src_mac_raw, '\x08\x06')
+            else:
+                eth_hdr = self.eth_hdr_broadcast
+
+            pkt = eth_hdr + self.arp_request_hdr + self.arp_src + arp_dst
+            self.tx_packet(pkt)
+
+    def update_arp_headers(self):
+        if self.src_ip and self.src_mac_raw:
+            self.eth_hdr_broadcast = struct.pack("!6s6s2s", '\xff\xff\xff\xff\xff\xff', self.src_mac_raw, '\x08\x06')
+            self.arp_request_hdr = struct.pack("!2s2s1s1s2s", '\x00\x01', '\x08\x00', '\x06', '\x04', '\x00\x01')
+            self.arp_reply_hdr = struct.pack("!2s2s1s1s2s", '\x00\x01', '\x08\x00', '\x06', '\x04', '\x00\x02')
+            self.arp_src = struct.pack("!6s4s", self.src_mac_raw, socket.inet_aton(self.src_ip))
+        else:
+            self.eth_hdr_broadcast = None
+            self.arp_request_hdr = None
+            self.arp_reply_hdr = None
+            self.arp_src = None
+
+
+class RedistributeNeighbor(NetlinkManagerWithListener):
+
+    def __init__(self, args, groups):
+        NetlinkManagerWithListener.__init__(self, groups, start_listener=False)
+        self.args = args
+        self.shutdown_event = Event()
+        self.links_by_index = {}
+        self.debug_arp = {}
+        self.caught_exception = False
+        self.loglevel = 'INFO'
+        self.keepalive = 3
+        self.holdtime = 9
+        self.route_table = 10
+        self.unicast_arp_requests = True
+        self.name = os.path.basename(sys.argv[0])
+        self.pidfile = os.path.abspath("/var/run/%s.pid" % self.name)
+        self.lock = lockfile.FileLock(self.pidfile)
+        self.my_macs = get_my_macs()
+        self.ignore_ifindex = {}
+
+        # Logging has not been initialized yet so store errors until we can log them
+        self.errors_to_log = []
+
+    def signal_handler(self, signal, frame):
+        self.shutdown_event.set()
+        self.arp_listener.shutdown_event.set()
+        self.timer_wheel.shutdown_event.set()
+        self.shutdown_flag = True  # For NetlinkManager shutdown
+        self.listener.shutdown_event.set()
+
+    def signal_term_handler(self, signal, frame):
+        log.info("rdnbrd: Caught SIGTERM")
+        self.signal_handler(signal, frame)
+
+    def signal_int_handler(self, signal, frame):
+        log.info("rdnbrd: Caught SIGINT")
+        self.signal_handler(signal, frame)
+
+    def pidfile_write(self):
+        """
+        check/create/delete pidfile to avoid duplicate instances
+        """
+        MAX_PIDFILE_ATTEMPTS = 10
+
+        for x in xrange(MAX_PIDFILE_ATTEMPTS):
+            if self.shutdown_event.is_set():
+                return
+            elif os.path.isfile(self.pidfile):
+                log.info("Waiting for pid file %s to be deleted (attempt %d/%d)" %
+                         (self.pidfile, x + 1, MAX_PIDFILE_ATTEMPTS))
+                sleep(1)
+            else:
+                break
+        else:
+            raise RuntimeError("Another instance of %s is running, see %s" % (self.name, self.pidfile))
+
+        try:
+            fh = open(self.pidfile, 'w')
+        except Exception as e:
+            log.exception(e)
+            self.lock.release()
+            raise RuntimeError("Cannot open pid file %s" % self.pidfile)
+        fh.write("{0}\n".format(self.pid))
+        fh.flush()
+        self.pidfh = fh
+        log.info("PID %d written to %s" % (self.pid, self.pidfile))
+
+    def pidfile_delete(self):
+        os.unlink(self.pidfile)
+
+    def get_link_from_ifindex(self, ifindex, ifname, reason):
+
+        if ifindex not in self.links_by_index:
+            if not ifname:
+                ifname = get_ifname(ifindex)
+
+            self.links_by_index[ifindex] = Link(
+                ifname,
+                ifindex,
+                self.route_table,
+                self.unicast_arp_requests,
+                self.debug_arp.get(ifname),
+                reason)
+
+        return self.links_by_index[ifindex]
+
+    def ip_host_add(self, link, ip, mac, reason):
+
+        if ip is None:
+            host = link.hosts_by_mac.get(mac)
+
+            if host:
+                ip = host.ip
+            else:
+                # We sometimes get RTM_NEWNEIGH messages for our own MACs (the
+                # MACs of the interfaces in that bridge)...ignore them
+                if mac not in self.my_macs:
+                    log.debug("%s: could not find IP for MAC %s (add %s)" % (link, mac, reason))
+                return None
+
+        # Ignore IPv4 link-local addresses.  We see these if BGP's ENHE (RFC 5549)
+        # feature is enabled.
+        if ip.startswith('169.254.'):
+            return None
+
+        # Ignore unspecified source address
+        if ip == '0.0.0.0':
+            return None
+
+        # We will add the host to the bridge itself (we are a member of a bridge)
+        if link.bridge:
+            return None
+
+        if ip not in link.hosts:
+            link.hosts[ip] = Host(ip, mac)
+            link.hosts_by_mac[mac] = link.hosts[ip]
+            log.debug("%s: created Host with IP %s MAC %s (%s)" % (link, ip, mac, reason))
+
+        host = link.hosts[ip]
+        add_to_list = []
+
+        # Add to the routing table
+        if not host.rib_installed:
+            add_to_list.append('RIB')
+            routes = []
+            ecmp_routes = []
+            nexthop = None
+            prefixlen = 32
+
+            routes.append((AF_INET, int(host.ip_obj), prefixlen, nexthop, link.index))
+            self.routes_add(routes,
+                            ecmp_routes,
+                            table=self.route_table,
+                            protocol=Route.RT_PROT_BOOT,
+                            route_scope=Route.RT_SCOPE_LINK)
+            host.rib_installed = True
+
+        if add_to_list:
+            log.info("%s: adding host %s to %s (%s)" % (link, host, ', '.join(add_to_list), reason))
+
+        return host
+
+    def ip_host_del(self, link, ip, mac, reason):
+
+        if ip is None:
+            host = link.hosts_by_mac.get(mac)
+
+            if host:
+                ip = host.ip
+            else:
+                # We sometimes get RTM_NEWNEIGH messages for our own MACs (the
+                # MACs of the interfaces in that bridge)...ignore them
+                if mac not in self.my_macs:
+                    log.debug("%s: could not find IP for MAC %s (del %s)" % (link, mac, reason))
+                return
+
+        # Ignore IPv4 link-local addresses.  We see these if BGP's ENHE (RFC 5549)
+        # feature is enabled.
+        if ip.startswith('169.254.'):
+            return
+
+        # Ignore unspecified source address
+        if ip == '0.0.0.0':
+            return None
+
+        if ip not in link.hosts:
+            log.debug("%s: No information about %s to delete (%s)" % (link, ip, reason))
+            return
+
+        host = link.hosts[ip]
+        delete_from_list = []
+
+        # Delete from the routing table
+        if host.rib_installed:
+            delete_from_list.append('RIB')
+            routes = []
+            ecmp_routes = []
+            nexthop = None
+            prefixlen = 32
+
+            routes.append((AF_INET, int(host.ip_obj), prefixlen, nexthop, link.index))
+            self.routes_del(routes,
+                            ecmp_routes,
+                            table=self.route_table,
+                            protocol=Route.RT_PROT_BOOT,
+                            route_scope=Route.RT_SCOPE_LINK)
+            host.rib_installed = False
+
+        # Delete from the neighbor table
+        delete_from_list.append('neighbor table')
+        self.neighbor_del(AF_INET, link.index, int(host.ip_obj), host.mac)
+
+        if delete_from_list:
+            log.info("%s: deleting host %s from %s (%s)" % (link, host, ', '.join(delete_from_list), reason))
+
+    def rx_rtm_newaddr(self, msg):
+        NetlinkManagerWithListener.rx_rtm_newaddr(self, msg)
+
+        if msg.ifindex in self.ignore_ifindex:
+            return
+
+        ifname = msg.get_attribute_value(Address.IFA_LABEL)
+        link = self.get_link_from_ifindex(msg.ifindex, ifname, msg.get_type_string())
+        ip = msg.get_attribute_value(Address.IFA_ADDRESS)
+
+        if ip and not link.src_ip:
+            ip = str(ip)
+            log.info("%s: ARP source IP is now %s" % (link, ip))
+            link.src_ip = ip
+            link.update_arp_headers()
+
+    def rx_rtm_deladdr(self, msg):
+        NetlinkManagerWithListener.rx_rtm_deladdr(self, msg)
+
+        if msg.ifindex in self.ignore_ifindex:
+            return
+
+        ifname = msg.get_attribute_value(Address.IFA_LABEL)
+        link = self.get_link_from_ifindex(msg.ifindex, ifname, msg.get_type_string())
+        ip = msg.get_attribute_value(Address.IFA_ADDRESS)
+
+        if ip and link.src_ip == ip:
+            ip = str(ip)
+            log.info("%s: ARP source IP %s was removed" % (link, ip))
+            link.src_ip = None
+            link.update_arp_headers()
+
+    def rx_rtm_newlink(self, msg):
+        NetlinkManagerWithListener.rx_rtm_newlink(self, msg)
+        ifname = msg.get_attribute_value(nlLink.IFLA_IFNAME)
+        bridge_ifindex = msg.get_attribute_value(nlLink.IFLA_MASTER)
+        link = self.get_link_from_ifindex(msg.ifindex, ifname, msg.get_type_string())
+        linkinfo = msg.get_attribute_value(nlLink.IFLA_LINKINFO)
+
+        if linkinfo and (linkinfo.get(nlLink.IFLA_INFO_KIND) == 'vrf' or linkinfo.get(nlLink.IFLA_INFO_SLAVE_KIND) == 'vrf'):
+            log.info("%s: vrf interface...ignoring" % link)
+            self.ignore_ifindex[msg.ifindex] = True
+            return
+        else:
+            if msg.ifindex in self.ignore_ifindex:
+                log.info("%s: used to be a vrf interface but is no longer a vrf interface" % link)
+                del self.ignore_ifindex[msg.ifindex]
+
+        if linkinfo and (linkinfo.get(nlLink.IFLA_INFO_KIND) == 'macvlan'):
+            lowerintf = msg.get_attribute_value(nlLink.IFLA_LINK)
+            if lowerintf:
+                lowername = self.get_link_from_ifindex(lowerintf,"",msg.get_type_string()).name
+                (base, sep, idx) = ifname.partition("-v")
+                if lowername == base and idx.isdigit():
+                    log.info("%s: vrr virtual interface...ignoring" % link)
+                    self.ignore_ifindex[msg.ifindex] = True
+                    return
+
+        link.src_mac = msg.get_attribute_value(nlLink.IFLA_ADDRESS)
+
+        if link.src_mac:
+            # IFLA_ADDRESS is normally a MAC address but in the case of GRE tunnels
+            # it will be an IPv4Address in which case link.src_mac will be an IPv4Address
+            # object instead of a string
+            if isinstance(link.src_mac, str):
+                link.src_mac_raw = link.src_mac.replace('.', '').replace(':', '').decode('hex')
+            else:
+                link.src_mac_raw = None
+        else:
+            link.src_mac_raw = None
+
+        link.update_arp_headers()
+
+        # For the most part we ignore links that are members of a bridge, we will
+        # work with the bridge interface itself. The exception is when a port
+        # comes UP, we need the bridge to send a gratuitous ARP.
+        if bridge_ifindex:
+
+            if msg.is_up():
+                bridge_id = self.get_link_from_ifindex(bridge_ifindex, None, msg.get_type_string())
+
+                # If we were not in a bridge before we need to call ip_host_del() for all of our hosts
+                if not link.bridge and bridge_id:
+                    hosts_to_delete = []
+
+                    for host in link.hosts.itervalues():
+                        hosts_to_delete.append(host)
+
+                    for host in hosts_to_delete:
+                        self.ip_host_del(link, host.ip, host.mac, 'interface transition to bridge/bond')
+                        del link.hosts[host.ip]
+                link.bridge = bridge_id
+
+                if link.bridge and not link.up:
+                    link.set_link_up()
+
+                    if link.bridge.up:
+                        reason = "%s %s" % (link, msg.get_type_string())
+                        link.bridge.send_gratuitous_arp(reason)
+                    else:
+                        log.debug("%s: is up but bridge %s is down, skip sending a gratuitous ARP" %
+                                  (link, link.bridge))
+            else:
+                link.set_link_down()
+
+        else:
+            if msg.is_up():
+                link.set_link_up()
+            else:
+                if link.up:
+                    for host in link.hosts.itervalues():
+                        self.ip_host_del(link, host.ip, host.mac, 'link down')
+                link.set_link_down()
+
+    def rx_rtm_dellink(self, msg):
+        NetlinkManagerWithListener.rx_rtm_dellink(self, msg)
+        ifname = msg.get_attribute_value(nlLink.IFLA_IFNAME)
+        link = self.get_link_from_ifindex(msg.ifindex, ifname, msg.get_type_string())
+        linkinfo = msg.get_attribute_value(nlLink.IFLA_LINKINFO)
+
+        if linkinfo and (linkinfo.get(nlLink.IFLA_INFO_KIND) == 'vrf' or linkinfo.get(nlLink.IFLA_INFO_SLAVE_KIND) == 'vrf'):
+            log.info("%s: vrf interface...ignoring" % link)
+            if msg.ifindex in self.ignore_ifindex:
+                del self.ignore_ifindex[msg.ifindex]
+            return
+
+        if link.up:
+            for host in link.hosts.itervalues():
+                self.ip_host_del(link, host.ip, host.mac, 'link deleted')
+        link.set_link_down()
+        log.info("%s: deleting link due to RTM_DELLINK" % link)
+        del self.links_by_index[msg.ifindex]
+
+    def rx_rtm_newneigh(self, msg):
+        NetlinkManagerWithListener.rx_rtm_newneigh(self, msg)
+
+        if msg.ifindex in self.ignore_ifindex:
+            return
+
+        ip = msg.get_attribute_value(Neighbor.NDA_DST)
+        mac = msg.get_attribute_value(Neighbor.NDA_LLADDR)
+        link = self.get_link_from_ifindex(msg.ifindex, None, msg.get_type_string())
+        reason = "%s %s" % (msg.get_type_string(), Neighbor.state_to_string.get(msg.state))
+
+        # If we bounce a bridge we get IPless NEWNEIGHs for the ports in that bridge
+        if ip:
+            ip = str(ip)
+
+        if link.bridge:
+            link = link.bridge
+
+        if msg.state in (Neighbor.NUD_PERMANENT, Neighbor.NUD_REACHABLE, Neighbor.NUD_STALE):
+            self.ip_host_add(link, ip, mac, reason)
+        else:
+            self.ip_host_del(link, ip, mac, reason)
+
+    def rx_rtm_delneigh(self, msg):
+        NetlinkManagerWithListener.rx_rtm_delneigh(self, msg)
+
+        if msg.ifindex in self.ignore_ifindex:
+            return
+
+        ip = msg.get_attribute_value(Neighbor.NDA_DST)
+        mac = msg.get_attribute_value(Neighbor.NDA_LLADDR)
+        link = self.get_link_from_ifindex(msg.ifindex, None, msg.get_type_string())
+        reason = "%s %s" % (msg.get_type_string(), Neighbor.state_to_string.get(msg.state))
+
+        # If we bounce a bridge we get IPless NEWNEIGHs for the ports in that bridge
+        if ip:
+            ip = str(ip)
+
+        if link.bridge:
+            link = link.bridge
+
+        self.ip_host_del(link, ip, mac, reason)
+
+    def process_config_file(self):
+        filename = '/etc/rdnbrd.conf'
+
+        if not os.path.isfile(filename):
+            self.errors_to_log.append("%s: does not exist" % filename)
+            return
+
+        valid_loglevels = ('CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG')
+
+        with open(filename) as fh:
+            for line in fh.readlines():
+                line = line.strip()
+
+                # Ignore comments and blank lines
+                if line.startswith('#') or not line:
+                    pass
+
+                elif '=' in line:
+                    (key, value) = line.split('=')
+                    key = key.strip()
+                    value = value.strip()
+
+                    if key == 'keepalive' or key == 'holdtime' or key == 'route_table':
+                        if value.isdigit() and int(value) > 0:
+
+                            if key == 'keepalive':
+                                self.keepalive = int(value)
+                            elif key == 'holdtime':
+                                self.holdtime = int(value)
+                            elif key == 'route_table':
+                                self.route_table = int(value)
+                        else:
+                            self.errors_to_log.append("%s: %s value must be a positive integer" %
+                                                      (filename, key))
+
+                    elif key == 'loglevel':
+                        value = value.upper()
+
+                        if value in valid_loglevels:
+                            self.loglevel = value
+                        else:
+                            self.errors_to_log.append("%s: loglevel must be one of %s" %
+                                                      (filename, ', '.join(valid_loglevels)))
+
+                    elif key == 'unicast_arp_requests':
+                        if value.upper() == 'TRUE':
+                            self.unicast_arp_requests = True
+                        else:
+                            self.unicast_arp_requests = False
+
+                    elif key == 'debug_arp':
+                        # Forgive the user if they use commas to separate interface names
+                        value = value.replace(',', ' ')
+                        value = value.strip()
+
+                        for ifname in value.split():
+                            self.debug_arp[ifname] = True
+
+                    else:
+                        self.errors_to_log.append("%s: %s is not a supported key" % (filename, key))
+                else:
+                    self.errors_to_log.append("%s: Unable to parse '%s'" % (filename, line))
+
+        min_holdtime = self.keepalive * 3
+
+        if self.holdtime < min_holdtime:
+            self.errors_to_log.append("%s: holdtime %d must be at least '3 x keepalive', setting holdtime to %d" %
+                                      (filename, self.holdtime, min_holdtime))
+            self.holdtime = min_holdtime
+
+    def main(self):
+        self.pidfile = '/var/run/rdnbrd.pid'
+
+        # Extract options from the config file
+        self.process_config_file()
+
+        # Now that we have parsed the config file we can setup logging
+        try:
+            logger_init(self.loglevel)
+        except Exception as e:
+            # If daemonized, stderr is /dev/null!
+            sys.stderr.write("Unable to set up logging:\n%s\n" % str(e))
+            sys.exit(1)
+
+        # Log any errors we found while parsing the config file
+        for line in self.errors_to_log:
+            log.error(line)
+
+        self.pidfh = None
+        self.pid = os.getpid()
+
+        self.listener = NetlinkListener(self, self.groups)
+        self.arp_listener = ArpListener(self)
+        self.timer_wheel = TimerWheel(self)
+
+        # Write the PID file
+        try:
+            self.pidfile_write()
+            log.info("rdnbrd daemon started, pid %d" % self.pid)
+        except RuntimeError as e:
+            log.error("rdnbrd already running, pid %d did not start!" % self.pid)
+            sys.exit(1)
+
+        self.arp_listener.start()
+        self.timer_wheel.start()
+        self.listener.start()
+
+        # uncomment to enable color coded hexdump
+        # rn.debug_address(True)
+        # rn.debug_link(True)
+        # rn.debug_neighbor(True)
+        # rn.debug_route(True)
+        self.workq.put(('GET_ALL_LINKS', None))
+        self.workq.put(('GET_ALL_ADDRESSES', None))
+        self.workq.put(('GET_ALL_NEIGHBORS', None))
+
+        current_epoch = int(os.times()[4])
+        self.timer_wheel.add_event(current_epoch + 1, 'CHECK_HOLDTIMES', None)
+        self.timer_wheel.add_event(current_epoch + 1, 'ARP_PING_TX', None)
+
+        while True:
+
+            try:
+
+                # Sleep until our alarm goes off...NetlinkListener will set the alarm once it
+                # has placed a NetlinkPacket object on our netlinkq. If someone places an item on
+                # our workq they should also set our alarm...if they don't it is not the end of
+                # the world as we will wake up in 1s anyway to check to see if our shutdown_event
+                # has been set.
+                self.alarm.wait(1)
+                self.alarm.clear()
+
+                if self.shutdown_event.is_set():
+                    log.info("RedistributeNeighbor shutting down")
+                    break
+
+                while not self.workq.empty():
+                    (workq_event, workq_options) = self.workq.get()
+
+                    # These first three get() methods are inherited from NetlinkManagerWithListener
+                    if workq_event == 'GET_ALL_ADDRESSES':
+                        self.get_all_addresses()
+
+                    elif workq_event == 'GET_ALL_LINKS':
+                        self.get_all_links()
+
+                    elif workq_event == 'GET_ALL_NEIGHBORS':
+                        self.get_all_neighbors()
+
+                    elif workq_event == 'SERVICE_NETLINK_QUEUE':
+                        self.service_netlinkq()
+
+                    elif workq_event == 'CHECK_HOLDTIMES':
+                        current_epoch = int(os.times()[4])
+
+                        # purge any hosts that have been quiet for more than holdtime.
+                        # This is a potential hotspot as we are looping over every up
+                        # interface and over every host each of those interfaces. If
+                        # scaling becomes an issue this is the first place to look.
+                        for link in self.links_by_index.itervalues():
+                            if link.up and (current_epoch - link.up_epoch) >= self.holdtime:
+                                hosts_to_delete = []
+
+                                # If the interface has been up for at least holdtime then purge any dead hosts
+                                for host in link.hosts.itervalues():
+                                    if (host.rib_installed and
+                                            (current_epoch - host.last_arp_rxed_epoch) >= self.holdtime):
+                                        hosts_to_delete.append(host)
+
+                                for host in hosts_to_delete:
+                                    self.ip_host_del(link, host.ip, host.mac, 'holdtime')
+                                    del link.hosts[host.ip]
+
+                        self.timer_wheel.add_event(int(os.times()[4]) + 1, 'CHECK_HOLDTIMES', None)
+
+                    elif workq_event == 'ARP_PING_TX':
+                        current_epoch = int(os.times()[4])
+
+                        # TX an ARP request to all host so we can figure out if they are still alive
+                        for link in self.links_by_index.itervalues():
+                            link.arp_ping(current_epoch, self.keepalive)
+
+                        self.timer_wheel.add_event(int(os.times()[4]) + 1, 'ARP_PING_TX', None)
+
+                    elif workq_event == 'ARP_REQUEST_OR_REPLY_RXED':
+                        current_epoch = int(os.times()[4])
+
+                        for (link, arp_src_ip, arp_src_mac, arp_src_mac_raw) in workq_options:
+                            host = self.ip_host_add(link, arp_src_ip, arp_src_mac, 'ARP request/reply RXed')
+
+                            if host:
+                                host.last_arp_rxed_epoch = current_epoch
+                    else:
+                        raise Exception("%s is an unsupported workq_event" % workq_event)
+
+            except Exception as e:
+                log.exception(e)
+                self.caught_exception = True
+                break
+
+        # cleanup
+        log.info("Flushing routes in table %s" % self.route_table)
+        try:
+            check_call(["/sbin/ip", "route", "flush", "table", str(self.route_table)])
+        except CalledProcessError as e:
+            log.critical("Unable to flush routes\n%s" % e)
+
+        log.info("Signal threads to shutdown")
+        self.arp_listener.shutdown_event.set()
+        self.timer_wheel.shutdown_event.set()
+        self.shutdown_flag = True  # For NetlinkManager shutdown
+        self.listener.shutdown_event.set()
+
+        # Close the raw sockets for each interface
+        for link in self.links_by_index.itervalues():
+            link.sockets_free()
+
+        log.info("Wait for threads to finish")
+        self.arp_listener.join()
+        self.timer_wheel.join()
+        self.listener.join()
+        log.info("All threads have fininshed")
+
+        self.pidfile_delete()
+
+        if self.caught_exception:
+            sys.exit(1)
+        else:
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+
+    # command line args
+    parser = argparse.ArgumentParser(
+        description="rdnbrd: daemon that implements redistribute ARP/ND",
+        epilog="The current version only implements redistributing ARP i.e IPv4",
+    )
+    parser.add_argument('-d', '--daemon', help='run as a daemon', action='store_true')
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s 1.3')
+    args = parser.parse_args()
+
+    groups = RTMGRP_LINK | RTMGRP_NEIGH | RTMGRP_IPV4_IFADDR
+    rn = RedistributeNeighbor(args, groups)
+
+    # We do not want to see netlink packets involving lo or eth0
+    for ifindex in (get_ifindex('lo'), get_ifindex('eth0')):
+        if ifindex:
+            rn.filter_by_ifindex(True, 'blacklist', RTM_NEWNEIGH, ifindex)
+            rn.filter_by_ifindex(True, 'blacklist', RTM_DELNEIGH, ifindex)
+            rn.filter_by_ifindex(True, 'blacklist', RTM_NEWLINK, ifindex)
+            rn.filter_by_ifindex(True, 'blacklist', RTM_DELLINK, ifindex)
+            rn.filter_by_ifindex(True, 'blacklist', RTM_NEWADDR, ifindex)
+            rn.filter_by_ifindex(True, 'blacklist', RTM_DELADDR, ifindex)
+
+    # We do not want to see netlink packets involving ipv6 neighbors or addresses
+    rn.filter_by_address_family(True, 'blacklist', RTM_NEWNEIGH, AF_INET6)
+    rn.filter_by_address_family(True, 'blacklist', RTM_DELNEIGH, AF_INET6)
+    rn.filter_by_address_family(True, 'blacklist', RTM_NEWADDR, AF_INET6)
+    rn.filter_by_address_family(True, 'blacklist', RTM_DELADDR, AF_INET6)
+    rn.filter_by_address_family(True, 'blacklist', RTM_NEWNEIGH, AF_BRIDGE)
+    rn.filter_by_address_family(True, 'blacklist', RTM_DELNEIGH, AF_BRIDGE)
+
+    if args.daemon:
+        context = DaemonContext(
+            working_directory='/var/run/',
+            signal_map = {
+                signal.SIGTERM: rn.signal_term_handler,
+                signal.SIGINT: rn.signal_int_handler
+            }
+        )
+
+        context.open()
+        with context:
+            rn.main()
+
+    else:
+        signal.signal(signal.SIGTERM, rn.signal_term_handler)
+        signal.signal(signal.SIGINT, rn.signal_int_handler)
+        rn.main()

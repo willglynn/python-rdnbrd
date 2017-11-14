@@ -1,0 +1,58 @@
+python-rdnbrd (3.0-cl3u7) RELEASED; urgency=medium
+
+  * Closes: CM-15926 VRR breaks redistribute neighbor 
+
+ -- dev-support <dev-support@cumulusnetworks.com>  Sat, 20 May 2017 17:12:27 -0700
+
+python-rdnbrd (3.0-cl3u6) RELEASED; urgency=medium
+
+  * Closes: CM-14604 Make logrotate more intelligent for high rotation rates
+
+ -- dev-support <dev-support@cumulusnetworks.com>  Tue, 18 Apr 2017 09:14:48 -0700
+
+python-rdnbrd (3.0-cl3u5) RELEASED; urgency=low
+
+  * Closes: CM-13865 crash when GRE interfaces are configured
+  * Closes: CM-13174 neighbors should not be in BRIB after ARP entries expire
+
+ -- dev-support <dev-support@cumulusnetworks.com>  Tue, 24 Jan 2017 10:45:59 -0800
+
+python-rdnbrd (3.0-cl3u4) RELEASED; urgency=medium
+
+  * Closes CM-13174 RDNBRD: Redistributed neighbors should not be in BRIB after ARP entries expire	
+
+ -- dev-support <dev-support@cumulusnetworks.com>  Tue, 08 Nov 2016 12:44:46 -0800
+
+python-rdnbrd (3.0-cl3u3) RELEASED; urgency=medium
+
+  * Closes: rdnbrd crashes when the dictionary size changes in a loop
+
+ -- dev-support <dev-support@cumulusnetworks.com>  Tue, 16 Aug 2016 12:50:46 +0000
+
+python-rdnbrd (3.0-cl3u2) RELEASED; urgency=medium
+
+  * Closes: CM-10918 RDNBRD: gracefully ignore vrf interfaces
+
+ -- Daniel Walton <dwalton@marvel-07.cumulusnetworks.com>  Thu, 19 May 2016 08:33:01 -0700
+
+python-rdnbrd (3.0-cl3u1) RELEASED; urgency=medium
+
+  * Closes: CM-10510 RDNBRD: logs to /var/log/syslog instead of /var/log/rdnbrd.log
+  * Closes: CM-10497 RDNBRD: node sees his own VRF devices as his neighbors
+  * Closes: CM-9906 RDNBRD: rdnbrd doesn't seem to work with bond interfaces
+  * Closes: CM-9524 python-rdnbrd: lists no install dependencies
+  * Closes: CM-9355 Systemd watchdog time out fix
+  * Closes: CM-9290 rndbrd: systemd integration
+  * Closes: CM-8807 RDNBRD barfs trying to create a raw_socket for sub interface
+  * Closes: CM-8785 rdnbrd: should use nlmanager instead of iproute2
+
+  * New. Enabled: Rename package from rdnbrd to python-rdnbrd
+  * New. Enabled: Fix auto-startup and use systemctl to restart rdnbrd
+
+ -- dev-support <dev-support@cumulusnetworks.com>  Wed, 04 May 2016 14:19:21 +0000
+
+python-rdnbrd (3.0) unstable; urgency=low
+
+  * Initial release
+
+ -- Daniel Walton <dwalton@cumulusnetworks.com>  Wed, 13 Jan 2016 11:25:29 -0700

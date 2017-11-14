@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+MYNAME="${0##*/}"
+
+report() { echo "${MYNAME}: $*" ; }
+report_warn() { report "Warning: $*" >&2 ; }
+report_err() { report "Error: $*" >&2 ; }
+
+if [ -f "/etc/rsyslog.d/35-rdnbrd.conf" ]
+then
+	systemctl restart rdnbrd
+fi
+#DEBHELPER#

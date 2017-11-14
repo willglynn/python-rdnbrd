@@ -1,0 +1,17 @@
+[Unit]
+Description=Cumulus Linux Redistribute Neighbor Service
+After=networking.service syslog.service
+#OnFailure=heartbeat-failed@%n.service
+
+[Service]
+EnvironmentFile=/etc/rdnbrd.conf
+Type=simple
+StartLimitInterval=3m
+StartLimitBurst=3
+TimeoutSec=1m
+#WatchdogSec=60s
+RestartSec=5
+Restart=always
+ExecStart=/usr/bin/python /usr/sbin/rdnbrd -d
+[Install]
+WantedBy=network-online.target
